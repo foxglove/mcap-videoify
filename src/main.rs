@@ -49,16 +49,17 @@ fn read_it() -> Result<()> {
     // Map of topic -> channel for the topic
     let mut topic_channels: HashMap<String, mcap::Channel> = HashMap::new();
 
+    let mut encoders_by_topic: HashMap<String, Encoder> = HashMap::new();
+
     let mut video_mcap = mcap::Writer::new(BufWriter::new(
         File::create("compressed_video.mcap").unwrap(),
     ))
     .unwrap();
 
-    let mut encoder: Option<Encoder> = None;
-
     for message in mcap::MessageStream::new(&mapped)? {
         let full_message = message.unwrap();
         let schema = full_message.channel.schema.as_ref().unwrap().clone();
+
         if schema.name.ne("foxglove.CompressedImage") || schema.encoding.ne("protobuf") {
             continue;
         }
@@ -84,12 +85,6 @@ fn read_it() -> Result<()> {
             .unwrap()
             .get_singular_field_or_default(parsed.as_ref());
 
-        // fixme - only certain supported formats?
-        let format = msg
-            .field_by_name("format")
-            .unwrap()
-            .get_singular_field_or_default(parsed.as_ref());
-
         let data = msg
             .field_by_name("data")
             .unwrap()
@@ -106,15 +101,17 @@ fn read_it() -> Result<()> {
         let width = usize::try_from(rgb8.width()).unwrap();
         let height = usize::try_from(rgb8.height()).unwrap();
 
-        if encoder.is_none() {
+        let topic = std::format!("{topic}_video", topic = full_message.channel.topic);
+
+        let encoder = encoders_by_topic.entry(topic.clone()).or_insert_with(||{
             // fixme - command line argument for bitrate
             let config =
                 EncoderConfig::new(rgb8.width(), rgb8.height()).set_bitrate_bps(10_000_000);
-            encoder = Some(Encoder::with_config(config).unwrap());
-        }
-
+            return Encoder::with_config(config).unwrap();
+        });
+         
         let yuv = YUVBuffer::with_rgb(width, height, &rgb8);
-        let bitstream = encoder.as_mut().unwrap().encode(&yuv).unwrap();
+        let bitstream = encoder.encode(&yuv).unwrap();
 
         let mut out_msg = foxglove::CompressedVideo::CompressedVideo::new();
 
@@ -135,8 +132,7 @@ fn read_it() -> Result<()> {
 
         let out_bytes: Vec<u8> = out_msg.write_to_bytes().unwrap();
 
-        let topic = std::format!("{topic}_video", topic = full_message.channel.topic);
-        let channel = topic_channels.entry(topic).or_insert_with_key(|key| {
+        let channel = topic_channels.entry(topic.clone()).or_insert_with_key(|key| {
             let new_channel = mcap::Channel {
                 schema: Some(Arc::new(compressed_video_schema.to_owned())),
                 topic: key.to_string(),
