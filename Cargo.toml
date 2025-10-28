@@ -8,9 +8,9 @@ openh264 = "0.4.1"
 image = "0.24.6"
 mcap = "0.7.1"
 anyhow = "1.0.75"
-protobuf = "3.3.0"
+protobuf = "3.4.0"
 camino = "1.1.6"
 memmap = "0.7.0"
 
 [build-dependencies]
-protobuf-codegen = "3.2.0"
+protobuf-codegen = "3.4.0"
