@@ -4,6 +4,8 @@ version = "0.0.0"
 edition = "2021"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+rosbags-rs = { version = "0.3", default-features = false }
 openh264 = "0.4.1"
 image = "0.24.6"
 mcap = "0.7.1"
