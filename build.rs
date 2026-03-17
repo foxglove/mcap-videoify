@@ -6,5 +6,6 @@ fn main() {
         .cargo_out_dir("generated_protos")
         .include("src/protos")
         .input("src/protos/CompressedVideo.proto")
+        .input("src/protos/CameraCalibration.proto")
         .run_from_script();
 }

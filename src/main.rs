@@ -179,6 +179,8 @@ fn scale_camera_info(ci: &Ros2CameraInfo, s: f64) -> Ros2CameraInfo {
 }
 
 /// Minimal CDR (little-endian) serialization for CameraInfo.
+/// Kept for potential future option to also emit ROS2 CameraInfo.
+#[allow(dead_code)]
 fn serialize_ros2_camera_info(ci: &Ros2CameraInfo) -> Vec<u8> {
     let mut out = Vec::new();
     // CDR encapsulation header (little endian)
@@ -237,6 +239,24 @@ fn serialize_ros2_camera_info(ci: &Ros2CameraInfo) -> Vec<u8> {
     align_to(&mut out, 1);
     out.push(if ci.roi_do_rectify { 1 } else { 0 });
     out
+}
+
+/// Build a Foxglove CameraCalibration message from parsed (and possibly scaled) ROS2 CameraInfo.
+fn ros2_camera_info_to_foxglove_calibration(
+    ci: &Ros2CameraInfo,
+) -> foxglove::CameraCalibration::CameraCalibration {
+    let mut msg = foxglove::CameraCalibration::CameraCalibration::new();
+    msg.timestamp.mut_or_insert_default().seconds = ci.header.stamp.sec as i64;
+    msg.timestamp.mut_or_insert_default().nanos = ci.header.stamp.nanosec as i32;
+    msg.frame_id = ci.header.frame_id.clone();
+    msg.width = ci.width;
+    msg.height = ci.height;
+    msg.distortion_model = ci.distortion_model.clone();
+    msg.D = ci.d.clone();
+    msg.K = ci.k.to_vec();
+    msg.R = ci.r.to_vec();
+    msg.P = ci.p.to_vec();
+    msg
 }
 
 /// Convert raw ROS 2 Image buffer to RGB8 (row-major, 3 bytes per pixel) for the encoder.
@@ -410,6 +430,9 @@ fn run(cli: &Cli) -> Result<()> {
     set.file
         .push(foxglove::CompressedVideo::file_descriptor().proto().clone());
     set.file.push(
+        foxglove::CameraCalibration::file_descriptor().proto().clone(),
+    );
+    set.file.push(
         ::protobuf::well_known_types::timestamp::file_descriptor()
             .proto()
             .clone(),
@@ -423,8 +446,16 @@ fn run(cli: &Cli) -> Result<()> {
         data: cow.clone(),
     };
 
+    let camera_calibration_schema = mcap::Schema {
+        name: "foxglove.CameraCalibration".to_string(),
+        encoding: "protobuf".to_string(),
+        data: cow.clone(),
+    };
+
     // Map of topic -> channel for video topics
     let mut topic_channels: HashMap<String, mcap::Channel> = HashMap::new();
+    // Map of topic -> channel for Foxglove CameraCalibration (when preserve_other_topics and we see CameraInfo)
+    let mut camera_calibration_channels: HashMap<String, mcap::Channel> = HashMap::new();
     // Map of channel key -> channel for passthrough (when preserve_other_topics)
     let mut passthrough_channels: HashMap<String, mcap::Channel> = HashMap::new();
 
@@ -464,23 +495,13 @@ fn run(cli: &Cli) -> Result<()> {
 
         if !is_foxglove_compressed_image && !is_ros2_compressed_image && !is_ros2_image {
             if cli.preserve_other_topics {
-                let channel_key = format!(
-                    "{}|{}",
-                    full_message.channel.topic,
-                    full_message.channel.message_encoding
-                );
-                let channel = passthrough_channels
-                    .entry(channel_key.clone())
-                    .or_insert_with_key(|_| {
-                        let ch = (*full_message.channel).clone();
-                        out_mcap.add_channel(&ch).expect("Couldn't write channel");
-                        ch
-                    });
-                let data = if is_ros2_camera_info {
+                if is_ros2_camera_info {
+                    // Convert to Foxglove CameraCalibration only; do not passthrough ROS2 CameraInfo
+                    // so the topic has a single schema (Foxglove can't show multiple schemas per topic).
                     let ns = topic_parent_namespace(&full_message.channel.topic);
-                    if let Some(&scale) = scaled_namespace_scale.get(&ns) {
-                        match parse_ros2_camera_info(&full_message.data) {
-                            Ok(ci) => {
+                    match parse_ros2_camera_info(&full_message.data) {
+                        Ok(ci) => {
+                            let ci = if let Some(&scale) = scaled_namespace_scale.get(&ns) {
                                 let scaled = scale_camera_info(&ci, scale);
                                 eprintln!(
                                     "[videoify] CameraInfo scaled: topic={} {}x{} -> {}x{}",
@@ -490,27 +511,63 @@ fn run(cli: &Cli) -> Result<()> {
                                     scaled.width,
                                     scaled.height
                                 );
-                                Cow::from(serialize_ros2_camera_info(&scaled))
-                            }
-                            Err(e) => {
-                                eprintln!("[videoify] CameraInfo parse error (pass-through): {}", e);
-                                full_message.data.clone()
-                            }
+                                scaled
+                            } else {
+                                ci
+                            };
+                            let cal_topic = full_message.channel.topic.clone();
+                            let cal_channel = camera_calibration_channels
+                                .entry(cal_topic.clone())
+                                .or_insert_with_key(|key| {
+                                    let new_channel = mcap::Channel {
+                                        schema: Some(Arc::new(camera_calibration_schema.clone())),
+                                        topic: key.to_string(),
+                                        message_encoding: "protobuf".to_string(),
+                                        metadata: std::collections::BTreeMap::new(),
+                                    };
+                                    out_mcap
+                                        .add_channel(&new_channel)
+                                        .expect("Couldn't write CameraCalibration channel");
+                                    new_channel
+                                });
+                            let cal_msg = ros2_camera_info_to_foxglove_calibration(&ci);
+                            let cal_bytes = cal_msg.write_to_bytes().unwrap();
+                            let cal_message = mcap::Message {
+                                channel: Arc::new(cal_channel.clone()),
+                                data: Cow::from(cal_bytes),
+                                log_time: full_message.log_time,
+                                publish_time: full_message.publish_time,
+                                sequence: full_message.sequence,
+                            };
+                            out_mcap.write(&cal_message).unwrap();
                         }
-                    } else {
-                        full_message.data.clone()
+                        Err(e) => {
+                            eprintln!("[videoify] CameraInfo parse error (skipping): {}", e);
+                        }
                     }
                 } else {
-                    full_message.data.clone()
-                };
-                let out_message = mcap::Message {
-                    channel: Arc::new(channel.clone()),
-                    data,
-                    log_time: full_message.log_time,
-                    publish_time: full_message.publish_time,
-                    sequence: full_message.sequence,
-                };
-                out_mcap.write(&out_message).unwrap();
+                    // Non-camera_info: passthrough with original schema
+                    let channel_key = format!(
+                        "{}|{}",
+                        full_message.channel.topic,
+                        full_message.channel.message_encoding
+                    );
+                    let channel = passthrough_channels
+                        .entry(channel_key.clone())
+                        .or_insert_with_key(|_| {
+                            let ch = (*full_message.channel).clone();
+                            out_mcap.add_channel(&ch).expect("Couldn't write channel");
+                            ch
+                        });
+                    let out_message = mcap::Message {
+                        channel: Arc::new(channel.clone()),
+                        data: full_message.data.clone(),
+                        log_time: full_message.log_time,
+                        publish_time: full_message.publish_time,
+                        sequence: full_message.sequence,
+                    };
+                    out_mcap.write(&out_message).unwrap();
+                }
             }
             continue;
         }
